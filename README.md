@@ -10,7 +10,7 @@ Target platform: **Databricks Free Edition** (serverless only, `workspace` Unity
 
 pandas_datareader still supports Stooq but it frequently fails with empty results due to limits or temporary blocks. While pandas_datareader is used here to fetch data from Sqoot programmatically, It does fail sometimes (especially in 2nd or 3rd run) returning no data.
 
-Direct CSV URLs (e.g., https://stooq.com/q/d/l/?s=AAPL.US&d1=...&d2=...&i=d) work for moderate use. Bulk historical data downloads (zipped files) are also available on their site for manual use.So another approach is download CSV for a region such as US - NASDAQ - DAILY data and programmatically read that into a Spark data frame for required tickers. 
+Direct CSV URLs (e.g., https://stooq.com/q/d/l/?s=AAPL.US&d1=...&d2=...&i=d) work for moderate use. Bulk historical data downloads (zipped files) are also available on their site for manual use. So another approach is download CSV for a region such as US - NASDAQ - DAILY data and programmatically read that into a Spark data frame for required tickers. 
 
 
 ## Synthetic Trade Data Generation
