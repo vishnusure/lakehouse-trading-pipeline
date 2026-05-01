@@ -1,7 +1,38 @@
-# Lakehouse Trading Pipeline
+# Case Study for Lakehouse Trading Pipeline 
+1. Pricing Data for tickets obtained using Sqoot http endpoint.
+2. Dirty trade data is synthesised and the process for doing so is included in notebooks/01_bronze.py
+
 
 Medallion-architecture pipeline (Bronze → Silver → Gold) for trading and financial data.  
 Target platform: **Databricks Free Edition** (serverless only, `workspace` Unity Catalog).
+
+
+## Synthetic Trade Data Generation
+
+### Synthetic Dirty Trade Data Generation
+
+The synthetic dirty trade data generation logic implemented in **`notebooks/01_bronze.py`**, starting at **line 146 to 208**.
+
+It generates a total of **210 rows** with intentional data quality issues (dirt), all seeded with `random.seed(42)` for full reproducibility.
+
+The generated dirt is specifically designed to be caught by the Silver layer's Data Quality (DQ) and quarantine logic.
+
+### Breakdown of Generated Data
+
+| Lines     | Row Count | Description |
+|-----------|-----------|-------------|
+| 171–185   | 160       | **Clean rows** (`version=1`) with random symbols, prices, and quantities |
+| 187–190   | 20        | **Duplicate rows** (same `trade_id`, `version=2`, price shifted by ±2%) |
+| 192–195   | 15        | Rows with `price=NULL` |
+| 197–200   | 10        | Rows with `quantity=NULL` |
+| 202–205   | 5         | Rows with `price="N/A"` (incorrect data type) |
+
+**Total: 210 rows**
+
+---
+
+**Purpose**:  
+This dataset simulates real-world messy trade data, allowing the data pipeline to demonstrate its cleaning, deduplication, and quarantine capabilities in the Silver layer.
 
 ---
 
@@ -35,18 +66,8 @@ workspace.bronze.market_prices_raw   workspace.bronze.trades_raw
 
 ---
 
-## Prerequisites
 
-1. **Databricks CLI** authenticated:
-   ```bash
-   databricks auth profiles          # confirm DEFAULT profile is VALID
-   ```
-
-2. **Python 3.8+** with the CLI installed (`pip install databricks-cli` or the newer unified CLI).
-
----
-
-## Deploy with Asset Bundles
+## How to Deploy with Asset Bundles and rerun the pipeline
 
 ```bash
 # From the repo root:
@@ -80,7 +101,7 @@ It will call notebooks 01 → 02 → 03 internally via `dbutils.notebook.run()`,
 
 ---
 
-## Verify data after a run
+## How to verify data after a run
 
 ```sql
 -- Bronze counts
@@ -109,7 +130,7 @@ ORDER BY table_schema, table_name;
 
 ---
 
-## View end-to-end lineage in Catalog Explorer
+## How to view end-to-end lineage in Catalog Explorer
 
 Unity Catalog automatically tracks table-level lineage every time a notebook reads or writes a managed Delta table.
 
@@ -153,7 +174,9 @@ lakehouse-trading-pipeline/
 
 ---
 
-## Free Edition constraints respected
+## Databricks Free Edition constraints respected
+
+The Notebooks and unity catalog are tuned to adhere to databricks free edition constraints, including the ingestion mechanism for pricing data for tickers from Sqoot HTTP endpoints.
 
 | Constraint | Implementation |
 |-----------|----------------|
@@ -165,4 +188,4 @@ lakehouse-trading-pipeline/
 | Small DataFrames | `coalesce(1)` on all staged DataFrames |
 | OPTIMIZE throttle | Fires only every 50 runs per table (tracked via audit table) |
 | No VACUUM on every run | Same 50-run threshold (extend to VACUUM if needed) |
-| Hive Metastore | Zero references — all tables use `workspace.<schema>.<table>` |
+
