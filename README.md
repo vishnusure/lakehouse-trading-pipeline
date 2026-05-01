@@ -1,1 +1,1 @@
-# Sqoot_Case_Study
+# Stooq_Case_Study
