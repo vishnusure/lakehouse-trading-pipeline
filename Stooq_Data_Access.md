@@ -166,11 +166,10 @@ This is the preferred approach for production batch processing.
 
 For daily or weekly batches:
 
-1. Someone opens Stooq in a browser.
-2. They solve the CAPTCHA.
-3. They download the ZIP file.
-4. They drop it into a designated ADLS landing zone using Azure Storage Explorer or `azcopy`.
-5. A Databricks Workflow with a file-arrival trigger automatically picks it up and runs the rest of the pipeline.
+1. Solve the Stooq CAPTCHA and download the bulk ZIP file for US region from Stooq.
+2. Land the ZIP in the Unity Catalog Volume or designated ADLS using Azure Storage Explorer or `azcopy`. 
+3. When the Zipped Bulk data is dropped into ADLS, it lives in the volume from the start. It streams entries out of the ZIP via the volume path:
+4. A Databricks Workflow with a file-arrival trigger automatically picks it up and runs the rest of the pipeline.
 
 ## Bulk Data Pipeline Diagram
 
