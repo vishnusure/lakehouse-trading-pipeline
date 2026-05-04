@@ -34,8 +34,7 @@ Databricks Free Edition has limited resources, so the following bottlenecks need
 - A 500 MB ZIP that extracts to roughly 1.5–2 GB of CSV files may require around 2.5 GB free on `/tmp` to hold both the ZIP and the extracted files.
 - There is a risk of `/tmp` running out of disk space.
 - The driver can be OOM-killed if a memory-bound operation such as `.read()` loads the whole ZIP into a bytes object.
-- These issues can be reduced by reading only the ticker entries needed from the ZIP archive instead of unpacking everything.
-- However, slow `dbutils.fs.cp` of a 500 MB file can still be a problem. Uploading the ZIP from local storage to DBFS can take minutes rather than seconds.
+- However, Databricks Free Edition's SDK using w.files.upload_from() can become a bottleneck for 8,000 small local text files, mainly because it uploads one file per API call from local compute to the Databricks Unity Catalog Volume. It can take minutes rather than seconds.
 
 ## Common Workarounds for Getting Stooq Data Programmatically
 
@@ -93,13 +92,11 @@ Stooq blocks or throttles requests from cloud IP ranges such as AWS, Azure, and 
 
 The most viable approach is:
 
-1. On a local computer, use direct CSV downloads via Python `requests` and `pandas.read_csv` to download data for all required tickers programmatically. Use a CSV file to store and read the list of tickers.
-2. Create a schema and volume in Databricks using the UI or SQL in a notebook cell to hold the CSV files.
-3. Upload the CSV files to the Databricks volume.
-4. Use PySpark processing in a Databricks Free Edition notebook to:
-   - Define a schema for Stooq data.
-   - Apply the schema to the CSV ticker files.
-   - Save the data as a Delta table in the Bronze layer.
+1. Create a Unity Catalog volume once in Databricks using Spark SQL in Databricks notebook.
+2. Install and Configure Databricks CLI authentication locally
+3. Install Databricks SDK locally
+4. Local Python script: download Stooq CSVs from per Ticker Stooq URL's and upload to volume using Databricks SDK (The SDK’s w.files.upload_from(...) is the recommended method for uploading from a local file path to a Unity Catalog volume.
+5. Read uploaded CSV files in Databricks notebook, Apply the schema to the CSV ticker files and Save the data as a Delta table in the Bronze layer.
 
 # How to Access Stooq Data in Production: Azure Databricks
 
