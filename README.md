@@ -12,7 +12,7 @@ Target platform: **Databricks Free Edition** (serverless only, `workspace` Unity
 2. Direct CSV URLs (e.g., https://stooq.com/q/d/l/?s=AAPL.US&d1=...&d2=...&i=d) work for moderate use but now require an API key.
 3. Bulk historical data downloads (zipped files) are also available on their site for manual use but require a Captcha.
 
-Detailed Architecture for Accessing and Downloading Stooq Data in Databricks Free Edition and also in a Production cluster (for example when using Azure Databricks) is available at [Stooq Data Access Guide here](Stooq_Data_Access.md)
+Detailed Architecture for Accessing and Downloading Stooq Data in Databricks Free Edition and also in a Production cluster (for example when using Azure Databricks) is available at [Stooq Data Access Guide](Stooq_Data_Access.md)
 
 ## Synthetic Trade Data Generation
 
