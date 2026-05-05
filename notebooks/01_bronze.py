@@ -1,307 +1,361 @@
 # Databricks notebook source
-
-# COMMAND ----------
 # MAGIC %md
-# MAGIC # 01 — Bronze Layer: Raw Ingestion
+# MAGIC ## Bronze: raw market prices and synthesised trades
 # MAGIC
-# MAGIC Fetches daily OHLCV prices from Stooq (7 tickers, last 90 days) and synthesises
-# MAGIC dirty trades in-memory. Both tables land in Unity Catalog as managed Delta tables
-# MAGIC via idempotent MERGE — safe to re-run at any time.
-# MAGIC
-# MAGIC **Outputs**
-# MAGIC - `{catalog}.bronze.market_prices_raw` — MERGE key: `(ticker, trade_date)`
-# MAGIC - `{catalog}.bronze.trades_raw`        — MERGE key: `(trade_id, version)`
+# MAGIC Reads CSVs landed in the UC volume by the local ingest, merges them into
+# MAGIC the prices table, and synthesises a deliberately dirty trades table for
+# MAGIC the Silver layer to clean and quarantine.
 
 # COMMAND ----------
 
-dbutils.widgets.text("run_date",     "",          "Run Date (YYYY-MM-DD, blank = today)")
-dbutils.widgets.text("env",          "prod",      "Environment")
-dbutils.widgets.text("catalog_name", "workspace", "Unity Catalog name")
+"""
+Bronze layer ingest for the Stooq trading pipeline.
+
+Inputs (consumed):
+  /Volumes/workspace/bronze/stooq_raw_volume/*.csv  (landed by scripts/ingest_stooq_local.py)
+
+Outputs (written):
+  workspace.bronze.market_prices_raw  (typed; MERGE on (ticker, date))
+  workspace.bronze.trades_raw         (mostly-string; MERGE on (trade_id, version))
+
+The trades table is synthesised in-notebook with intentional null, duplicate,
+malformed and out-of-range rows so the Silver layer's cast, dedup and
+referential-integrity checks have realistic work to do.
+
+Idempotent on re-run for both tables.
+"""
 
 # COMMAND ----------
 
-import datetime, json, random, string, time
+import random
+from datetime import datetime, timedelta
 
-import pandas as pd
+from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
-    StructType, StructField,
-    StringType, IntegerType, DoubleType, LongType, DateType, TimestampType,
+    DateType,
+    DoubleType,
+    IntegerType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
 )
 
-catalog    = dbutils.widgets.get("catalog_name")
-env        = dbutils.widgets.get("env")
-_run_date  = dbutils.widgets.get("run_date").strip()
-run_date   = datetime.date.fromisoformat(_run_date) if _run_date else datetime.date.today()
-start_date = run_date - datetime.timedelta(days=90)
+dbutils.widgets.text("catalog_name", "workspace")
+dbutils.widgets.text("env", "dev")
+dbutils.widgets.text("run_date", "")
 
-print(f"catalog={catalog}  env={env}  run_date={run_date}  window={start_date} → {run_date}")
+CATALOG = dbutils.widgets.get("catalog_name")
 
-# COMMAND ----------
-# ── Schema bootstrap (all 4 layers created here once) ─────────────────────────
-
-for _s in ["bronze", "silver", "gold", "audit"]:
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{_s}")
-    print(f"Schema ready: {catalog}.{_s}")
+VOLUME_PATH = f"/Volumes/{CATALOG}/bronze/stooq_raw_volume/"
+PRICES_TABLE = f"{CATALOG}.bronze.market_prices_raw"
+TRADES_TABLE = f"{CATALOG}.bronze.trades_raw"
 
 # COMMAND ----------
-# ── Stooq OHLCV price ingestion ───────────────────────────────────────────────
 
-TICKERS   = ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "JPM", "NVDA"]
-START_STR = start_date.strftime("%Y%m%d")
-END_STR   = run_date.strftime("%Y%m%d")
+# MAGIC %md
+# MAGIC ## Market prices
 
-# Staging schema: volume kept as Double to survive Stooq's occasional float output;
-# the target DDL declares it LONG — Delta MERGE performs the implicit numeric cast.
-PRICES_STAGE_SCHEMA = StructType([
-    StructField("ticker",      StringType(),  False),
-    StructField("trade_date",  DateType(),    True),
-    StructField("open_price",  DoubleType(),  True),
-    StructField("high_price",  DoubleType(),  True),
-    StructField("low_price",   DoubleType(),  True),
-    StructField("close_price", DoubleType(),  True),
-    StructField("volume",      DoubleType(),  True),
-    StructField("_source",     StringType(),  False),
+# COMMAND ----------
+
+# Stooq CSV header is "Date,Open,High,Low,Close,Volume". Schema is enforced
+# on read; malformed rows are nulled (default PERMISSIVE mode).
+prices_csv_schema = StructType([
+    StructField("Date", DateType(), True),
+    StructField("Open", DoubleType(), True),
+    StructField("High", DoubleType(), True),
+    StructField("Low", DoubleType(), True),
+    StructField("Close", DoubleType(), True),
+    StructField("Volume", LongType(), True),
 ])
 
-price_frames = []
-for ticker in TICKERS:
-    url = (
-        f"https://stooq.com/q/d/l/"
-        f"?s={ticker.lower()}.us&i=d&d1={START_STR}&d2={END_STR}"
-        f"&apikey=l8FmVeftQxDpkSlOZHNo7abwY05GjX1y"
+# Filename convention is fixed by the local ingest:
+#   {TICKER_WITH_EXCHANGE_SUFFIX}_{YYYYMMDD}_{YYYYMMDD}.csv  e.g. AAPL.US_20260204_20260505.csv
+ticker_pattern = r"([^/]+)_\d{8}_\d{8}\.csv$"
+
+prices_in = (
+    spark.read
+        .option("header", "true")
+        .schema(prices_csv_schema)
+        .csv(VOLUME_PATH)
+        .withColumn("_source_file", F.col("_metadata.file_path"))
+        .withColumn("ticker", F.regexp_extract(F.col("_source_file"), ticker_pattern, 1))
+        .withColumn("_ingested_at", F.current_timestamp())
+        .select(
+            F.col("ticker"),
+            F.col("Date").alias("date"),
+            F.col("Open").alias("open"),
+            F.col("High").alias("high"),
+            F.col("Low").alias("low"),
+            F.col("Close").alias("close"),
+            F.col("Volume").alias("volume"),
+            F.col("_source_file"),
+            F.col("_ingested_at"),
+        )
+)
+
+# COMMAND ----------
+
+# Create on first run, MERGE on subsequent runs so re-ingesting overlapping
+# date windows updates in place rather than appending duplicates.
+if not spark.catalog.tableExists(PRICES_TABLE):
+    (prices_in.write
+        .format("delta")
+        .saveAsTable(PRICES_TABLE))
+else:
+    (DeltaTable.forName(spark, PRICES_TABLE).alias("t")
+        .merge(
+            prices_in.alias("s"),
+            "t.ticker = s.ticker AND t.date = s.date",
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute())
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC COMMENT ON TABLE workspace.bronze.market_prices_raw IS
+# MAGIC   'Daily OHLCV per ticker, MERGE-loaded from CSVs in stooq_raw_volume. Bronze: typed but unvalidated.';
+# MAGIC
+# MAGIC ALTER TABLE workspace.bronze.market_prices_raw ALTER COLUMN ticker       COMMENT 'Stooq ticker including exchange suffix, e.g. AAPL.US.';
+# MAGIC ALTER TABLE workspace.bronze.market_prices_raw ALTER COLUMN date         COMMENT 'Trading date.';
+# MAGIC ALTER TABLE workspace.bronze.market_prices_raw ALTER COLUMN open         COMMENT 'Opening price.';
+# MAGIC ALTER TABLE workspace.bronze.market_prices_raw ALTER COLUMN high         COMMENT 'Intraday high.';
+# MAGIC ALTER TABLE workspace.bronze.market_prices_raw ALTER COLUMN low          COMMENT 'Intraday low.';
+# MAGIC ALTER TABLE workspace.bronze.market_prices_raw ALTER COLUMN close        COMMENT 'Closing price.';
+# MAGIC ALTER TABLE workspace.bronze.market_prices_raw ALTER COLUMN volume       COMMENT 'Daily traded share count.';
+# MAGIC ALTER TABLE workspace.bronze.market_prices_raw ALTER COLUMN _source_file COMMENT 'Originating CSV path in the volume.';
+# MAGIC ALTER TABLE workspace.bronze.market_prices_raw ALTER COLUMN _ingested_at COMMENT 'Timestamp this row was MERGE-loaded.';
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Trades (synthesised dirty data)
+
+# COMMAND ----------
+
+# Symbols are drawn from the prices DF rather than re-reading config/tickers.csv,
+# which is a Mac-side artefact not present on the cluster. Distinct tickers
+# already in bronze are the authoritative set for downstream RI checks.
+known_tickers = [
+    row["ticker"]
+    for row in prices_in.select("ticker").distinct().collect()
+    if row["ticker"]
+]
+
+if not known_tickers:
+    raise RuntimeError(
+        f"No tickers parsed from {VOLUME_PATH}. "
+        "Run scripts/ingest_stooq_local.py before this notebook."
     )
-    try:
-        pdf = pd.read_csv(url)
-        if pdf.empty or "Date" not in pdf.columns:
-            print(f"[WARN] {ticker}: unexpected/empty response — skipping")
-        else:
-            pdf = pdf.rename(columns={
-                "Date": "trade_date", "Open": "open_price",
-                "High": "high_price", "Low": "low_price",
-                "Close": "close_price", "Volume": "volume",
-            })
-            pdf["ticker"]     = ticker
-            pdf["_source"]    = "stooq"
-            pdf["trade_date"] = pd.to_datetime(pdf["trade_date"]).dt.date
-            pdf["volume"]     = pd.to_numeric(pdf["volume"], errors="coerce")
-            price_frames.append(
-                pdf[["ticker","trade_date","open_price","high_price",
-                      "low_price","close_price","volume","_source"]]
-            )
-            print(f"[OK] {ticker}: {len(pdf)} rows")
-    except Exception as ex:
-        print(f"[WARN] {ticker}: fetch error ({ex}) — skipping")
-    time.sleep(2)
 
-if not price_frames:
-    raise RuntimeError("No price data retrieved from Stooq — check network connectivity")
-
-prices_pdf = pd.concat(price_frames, ignore_index=True)
-
-prices_sdf = (
-    spark.createDataFrame(prices_pdf, schema=PRICES_STAGE_SCHEMA)
-         .withColumn("_ingest_ts", F.current_timestamp())
-         .coalesce(1)
+prices_window = (
+    spark.table(PRICES_TABLE)
+        .agg(F.min("date").alias("min_d"), F.max("date").alias("max_d"))
+        .first()
 )
-prices_count_in = prices_sdf.count()
-print(f"Total price rows staged: {prices_count_in}")
+window_start = prices_window["min_d"]
+window_end = prices_window["max_d"]
 
 # COMMAND ----------
-# ── Create market_prices_raw (if first run) then idempotent MERGE ─────────────
 
-spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {catalog}.bronze.market_prices_raw (
-    ticker       STRING    NOT NULL COMMENT 'Stock ticker symbol (e.g. AAPL)',
-    trade_date   DATE      NOT NULL COMMENT 'Trading date sourced from Stooq',
-    open_price   DOUBLE             COMMENT 'Opening price in USD',
-    high_price   DOUBLE             COMMENT 'Intraday high price in USD',
-    low_price    DOUBLE             COMMENT 'Intraday low price in USD',
-    close_price  DOUBLE             COMMENT 'Closing price in USD',
-    volume       LONG               COMMENT 'Number of shares traded on this day',
-    _source      STRING             COMMENT 'Source system identifier (stooq)',
-    _ingest_ts   TIMESTAMP          COMMENT 'UTC timestamp when this row was ingested'
-)
-USING DELTA
-COMMENT 'Bronze layer: raw daily OHLCV prices fetched from Stooq one ticker at a time. Idempotent via MERGE on (ticker, trade_date). No transformations applied.'
-CLUSTER BY (ticker, trade_date)
-""")
-
-prices_sdf.createOrReplaceTempView("_prices_stage")
-
-spark.sql(f"""
-MERGE INTO {catalog}.bronze.market_prices_raw AS t
-USING _prices_stage AS s
-  ON t.ticker = s.ticker AND t.trade_date = s.trade_date
-WHEN MATCHED THEN
-    UPDATE SET *
-WHEN NOT MATCHED THEN
-    INSERT *
-""")
-
-prices_count_out = spark.table(f"{catalog}.bronze.market_prices_raw").count()
-print(f"market_prices_raw — total rows after MERGE: {prices_count_out}")
-
-# COMMAND ----------
-# ── Synthetic dirty trades (in-memory, no external call) ──────────────────────
-#
-# Dirt breakdown (intentional, for Silver quarantine testing):
-#   160 clean rows  (version=1)
-#    20 duplicates  (same trade_id, version=2, price shifted ±2 %)
-#    15 null price  (new trade_ids, version=1, price=NULL)
-#    10 null qty    (new trade_ids, version=1, quantity=NULL)
-#     5 bad type    (new trade_ids, version=1, price="N/A")
-#   ─────────────────
-#   210 total rows staged
-
+# Synthesise 200 rows. Seeded so re-runs produce the same dirty distribution;
+# duplicates are appended at the end and collapsed by MERGE on insert.
 random.seed(42)
 
-def _rid(prefix="TRD-", n=6):
-    return prefix + "".join(random.choices(string.digits, k=n))
+UNKNOWN_SYMBOL = "ZZZZ.US"
+SIDES_VALID = ["BUY", "SELL"]
+BOOKS = ["EQUITY-A", "EQUITY-B", "MACRO", "PROP"]
 
-SYMBOLS        = ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "JPM", "NVDA"]
-BOOKS          = ["EQUITY-US", "EQUITY-EU", "FIXED-INCOME", "DERIVATIVES"]
-COUNTERPARTIES = ["GS", "MS", "BARC", "DB", "CITI", "JPM", "UBS"]
-TRADERS        = [_rid("T", 4) for _ in range(10)]
-_BASE          = run_date - datetime.timedelta(days=30)
+n_unique = 180
+n_dup_appends = 20
+window_days = (window_end - window_start).days + 1
 
-def _rdate():
-    return (_BASE + datetime.timedelta(days=random.randint(0, 29))).isoformat()
 
-clean_rows = [
-    {
-        "trade_id":    _rid(),
-        "version":     1,
-        "symbol":      random.choice(SYMBOLS),
-        "book":        random.choice(BOOKS),
-        "trade_date":  _rdate(),
-        "quantity":    str(random.randint(100, 10_000)),
-        "price":       str(round(random.uniform(10.0, 800.0), 2)),
-        "counterparty":random.choice(COUNTERPARTIES),
-        "trader_id":   random.choice(TRADERS),
-        "_source":     "synthetic",
-    }
-    for _ in range(160)
-]
+def _synth_row(i: int) -> tuple:
+    trade_id = f"T{i:05d}"
+    if random.random() < 0.10:
+        trade_id = None
+    elif random.random() < 0.05:
+        trade_id = ""
 
-dup_rows = [
-    {**r, "version": 2, "price": str(round(float(r["price"]) * random.uniform(0.98, 1.02), 2))}
-    for r in random.sample(clean_rows, 20)
-]
+    # Most trades are v1; ~10% of valid ids get a v2, a few a v3.
+    version = 1
+    if trade_id and random.random() < 0.10:
+        version = 2 if random.random() > 0.20 else 3
+    if random.random() < 0.05:
+        version = None
 
-null_price_rows = [
-    {**r, "trade_id": _rid(), "version": 1, "price": None}
-    for r in random.sample(clean_rows, 15)
-]
+    symbol = UNKNOWN_SYMBOL if random.random() < 0.05 else random.choice(known_tickers)
+    side = random.choice(SIDES_VALID + [None, "garbage"])
+    book = random.choice(BOOKS)
 
-null_qty_rows = [
-    {**r, "trade_id": _rid(), "version": 1, "quantity": None}
-    for r in random.sample(clean_rows, 10)
-]
+    r = random.random()
+    if r < 0.05:
+        qty = random.choice(["abc", "ten", " "])
+    elif r < 0.10:
+        qty = str(random.choice([0, -50, -1]))
+    else:
+        qty = str(random.randint(1, 5000))
 
-bad_type_rows = [
-    {**r, "trade_id": _rid(), "version": 1, "price": "N/A"}
-    for r in random.sample(clean_rows, 5)
-]
+    r = random.random()
+    if r < 0.05:
+        price = random.choice(["$50", "n/a", "--"])
+    elif r < 0.10:
+        price = f"{random.uniform(-100, 0):.2f}"
+    else:
+        price = f"{random.uniform(50, 500):.2f}"
 
-all_trades = clean_rows + dup_rows + null_price_rows + null_qty_rows + bad_type_rows
-print(f"Synthetic dirty trades synthesised: {len(all_trades)} rows")
+    if random.random() < 0.05:
+        trade_ts = random.choice(["not-a-date", "2026-13-40", ""])
+    else:
+        offset = random.randint(0, max(window_days - 1, 0))
+        ts = datetime.combine(window_start, datetime.min.time()) + timedelta(
+            days=offset,
+            hours=random.randint(9, 16),
+            minutes=random.randint(0, 59),
+            seconds=random.randint(0, 59),
+        )
+        trade_ts = ts.strftime("%Y-%m-%d %H:%M:%S")
 
-# trade_date kept as STRING in this schema; cast to DATE via withColumn below
-TRADES_STAGE_SCHEMA = StructType([
-    StructField("trade_id",     StringType(),  False),
-    StructField("version",      IntegerType(), False),
-    StructField("symbol",       StringType(),  True),
-    StructField("book",         StringType(),  True),
-    StructField("trade_date",   StringType(),  True),
-    StructField("quantity",     StringType(),  True),
-    StructField("price",        StringType(),  True),
-    StructField("counterparty", StringType(),  True),
-    StructField("trader_id",    StringType(),  True),
-    StructField("_source",      StringType(),  False),
+    return (trade_id, version, symbol, side, qty, price, trade_ts, book)
+
+
+rows = [_synth_row(i) for i in range(n_unique)]
+
+# Inject corrections so silver's latest-version-wins dedup has work to do.
+# A correction is a same-trade_id row with a higher version number and
+# mutated qty/price; symbol, side and book carry over from v1.
+def _correction_of(base: tuple, version: int) -> tuple:
+    trade_id, _v, symbol, side, _qty, _price, trade_ts, book = base
+    return (
+        trade_id,
+        version,
+        symbol,
+        side,
+        str(random.randint(1, 5000)),
+        f"{random.uniform(50, 500):.2f}",
+        trade_ts,
+        book,
+    )
+
+v1_correctable = [r for r in rows if r[0] not in (None, "") and r[1] == 1]
+v2_targets = random.sample(v1_correctable, k=min(15, len(v1_correctable)))
+rows.extend(_correction_of(r, 2) for r in v2_targets)
+v3_targets = random.sample(v2_targets, k=min(3, len(v2_targets)))
+rows.extend(_correction_of(r, 3) for r in v3_targets)
+
+# Append duplicates of existing rows so the in-memory set has true (id, version)
+# duplicates. The pre-MERGE dedup below collapses them to one row in bronze.
+dup_candidates = [r for r in rows if r[0] not in (None, "")]
+rows.extend(random.choice(dup_candidates) for _ in range(n_dup_appends))
+
+trades_schema = StructType([
+    StructField("trade_id", StringType(), True),
+    StructField("version",  IntegerType(), True),
+    StructField("symbol",   StringType(), True),
+    StructField("side",     StringType(), True),
+    StructField("qty",      StringType(), True),
+    StructField("price",    StringType(), True),
+    StructField("trade_ts", StringType(), True),
+    StructField("book",     StringType(), True),
 ])
 
-trades_sdf = (
-    spark.createDataFrame(pd.DataFrame(all_trades), schema=TRADES_STAGE_SCHEMA)
-         .withColumn("trade_date", F.to_date("trade_date"))
-         .withColumn("_ingest_ts", F.current_timestamp())
-         .coalesce(1)
+# Dedup on the merge keys (null-safe in dropDuplicates) so MERGE never sees
+# multiple source matches for a single target row. Bronze keeps the row but
+# attribution to "raw" is preserved by _ingested_at.
+trades_in = (
+    spark.createDataFrame(rows, schema=trades_schema)
+        .dropDuplicates(["trade_id", "version"])
+        .withColumn("_ingested_at", F.current_timestamp())
+        .coalesce(1)
 )
-trades_count_in = trades_sdf.count()
-print(f"Trades staged in Spark: {trades_count_in}")
 
 # COMMAND ----------
-# ── Create trades_raw (if first run) then idempotent MERGE ────────────────────
 
-spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {catalog}.bronze.trades_raw (
-    trade_id      STRING    NOT NULL COMMENT 'Unique trade identifier',
-    version       INT       NOT NULL COMMENT 'Record version — higher version supersedes lower for the same trade_id',
-    symbol        STRING             COMMENT 'Instrument symbol (may contain dirty values)',
-    book          STRING             COMMENT 'Trading book (e.g. EQUITY-US, FIXED-INCOME, DERIVATIVES)',
-    trade_date    DATE               COMMENT 'Trade execution date',
-    quantity      STRING             COMMENT 'Raw quantity kept as STRING to preserve dirty values for Silver quarantine',
-    price         STRING             COMMENT 'Raw price kept as STRING to preserve dirty values (e.g. NULL, N/A) for Silver quarantine',
-    counterparty  STRING             COMMENT 'Counterparty short name (e.g. GS, MS, BARC)',
-    trader_id     STRING             COMMENT 'Trader identifier',
-    _source       STRING             COMMENT 'Source system identifier (synthetic)',
-    _ingest_ts    TIMESTAMP          COMMENT 'UTC timestamp when this row was ingested'
-)
-USING DELTA
-COMMENT 'Bronze layer: raw synthetic trades with intentional dirt — nulls in price/quantity, version duplicates, bad type strings. Idempotent MERGE on (trade_id, version). Silver applies DQ and quarantines bad rows.'
-CLUSTER BY (trade_id)
-""")
-
-trades_sdf.createOrReplaceTempView("_trades_stage")
-
-spark.sql(f"""
-MERGE INTO {catalog}.bronze.trades_raw AS t
-USING _trades_stage AS s
-  ON t.trade_id = s.trade_id AND t.version = s.version
-WHEN MATCHED THEN
-    UPDATE SET *
-WHEN NOT MATCHED THEN
-    INSERT *
-""")
-
-trades_count_out = spark.table(f"{catalog}.bronze.trades_raw").count()
-print(f"trades_raw — total rows after MERGE: {trades_count_out}")
-
-# COMMAND ----------
-# ── Conditional OPTIMIZE (triggers every 50 bronze runs) ──────────────────────
-# audit.pipeline_metrics is created by 04_job_runner; guard with try/except on
-# first run before that table exists.
-
-try:
-    bronze_runs = spark.sql(
-        f"SELECT COUNT(*) AS n FROM {catalog}.audit.pipeline_metrics WHERE task = 'bronze'"
-    ).collect()[0]["n"]
-except Exception:
-    bronze_runs = 0
-
-if bronze_runs > 0 and bronze_runs % 50 == 0:
-    print(f"Run #{bronze_runs}: triggering OPTIMIZE on bronze tables")
-    spark.sql(f"OPTIMIZE {catalog}.bronze.market_prices_raw")
-    spark.sql(f"OPTIMIZE {catalog}.bronze.trades_raw")
+# Null-safe equality (<=>) keeps re-runs idempotent for rows whose trade_id
+# or version is null: standard "=" treats NULL != NULL and would re-insert
+# them on every run.
+if not spark.catalog.tableExists(TRADES_TABLE):
+    (trades_in.write
+        .format("delta")
+        .saveAsTable(TRADES_TABLE))
 else:
-    print(f"Skipping OPTIMIZE — run #{bronze_runs + 1} (fires at multiples of 50)")
+    (DeltaTable.forName(spark, TRADES_TABLE).alias("t")
+        .merge(
+            trades_in.alias("s"),
+            "t.trade_id <=> s.trade_id AND t.version <=> s.version",
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute())
 
 # COMMAND ----------
-# ── Metrics payload (returned to 04_job_runner via dbutils.notebook.exit) ─────
 
-metrics = {
-    "task":           "bronze",
-    "rows_in":        prices_count_in + trades_count_in,
-    "rows_out":       prices_count_out + trades_count_out,
-    "rows_in_prices": prices_count_in,
-    "rows_out_prices":prices_count_out,
-    "rows_in_trades": trades_count_in,
-    "rows_out_trades":trades_count_out,
-    "rejects":        0,
-    "duplicates":     len(dup_rows),
-    "run_ts":         datetime.datetime.utcnow().isoformat(),
-    "catalog":        catalog,
-    "schema":         "bronze",
-}
-print(json.dumps(metrics, indent=2))
-dbutils.notebook.exit(json.dumps(metrics))
+# MAGIC %sql
+# MAGIC COMMENT ON TABLE workspace.bronze.trades_raw IS
+# MAGIC   'Synthesised dirty trades for the silver pipeline to clean. String columns hold raw, possibly invalid values.';
+# MAGIC
+# MAGIC ALTER TABLE workspace.bronze.trades_raw ALTER COLUMN trade_id     COMMENT 'Trade identifier; nullable in raw form.';
+# MAGIC ALTER TABLE workspace.bronze.trades_raw ALTER COLUMN version      COMMENT 'Monotonic version per trade_id; latest-wins in silver.';
+# MAGIC ALTER TABLE workspace.bronze.trades_raw ALTER COLUMN symbol       COMMENT 'Ticker as quoted on the trade ticket; checked against bronze prices in silver.';
+# MAGIC ALTER TABLE workspace.bronze.trades_raw ALTER COLUMN side         COMMENT 'BUY or SELL; other values quarantined.';
+# MAGIC ALTER TABLE workspace.bronze.trades_raw ALTER COLUMN qty          COMMENT 'Trade quantity, raw string. Cast and range-checked in silver.';
+# MAGIC ALTER TABLE workspace.bronze.trades_raw ALTER COLUMN price        COMMENT 'Trade price, raw string. Cast and range-checked in silver.';
+# MAGIC ALTER TABLE workspace.bronze.trades_raw ALTER COLUMN trade_ts     COMMENT 'Trade timestamp, raw string. Cast in silver.';
+# MAGIC ALTER TABLE workspace.bronze.trades_raw ALTER COLUMN book         COMMENT 'Trading book the trade is allocated to.';
+# MAGIC ALTER TABLE workspace.bronze.trades_raw ALTER COLUMN _ingested_at COMMENT 'Timestamp this row was MERGE-loaded.';
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Validation
+
+# COMMAND ----------
+
+display(spark.sql(f"""
+    SELECT ticker, COUNT(*) AS rows, MIN(date) AS min_date, MAX(date) AS max_date
+    FROM {PRICES_TABLE}
+    GROUP BY ticker
+    ORDER BY ticker
+"""))
+
+# COMMAND ----------
+
+display(spark.sql(f"""
+    SELECT
+        COUNT(*)                                                                AS total,
+        SUM(CASE WHEN trade_id IS NULL OR trade_id = '' THEN 1 ELSE 0 END)      AS bad_trade_id,
+        SUM(CASE WHEN version  IS NULL                  THEN 1 ELSE 0 END)      AS null_version,
+        SUM(CASE WHEN qty   NOT RLIKE '^-?[0-9]+$'      THEN 1 ELSE 0 END)      AS non_numeric_qty,
+        SUM(CASE WHEN price NOT RLIKE '^-?[0-9]+(\\\\.[0-9]+)?$' THEN 1 ELSE 0 END) AS non_numeric_price,
+        SUM(CASE WHEN symbol = 'ZZZZ.US'                THEN 1 ELSE 0 END)      AS unknown_symbol_rows,
+        COUNT(DISTINCT trade_id)                                                AS distinct_trade_ids
+    FROM {TRADES_TABLE}
+"""))
+
+# COMMAND ----------
+
+# Metrics handed back to 04_job_runner. duplicates is rows_in - rows_out:
+# bronze prices MERGE collapses re-ingested (ticker, date) keys, and the
+# trades synth dedupes on (trade_id, version) before the MERGE.
+import json
+
+bronze_csv_rows   = prices_in.count()
+bronze_synth_rows = len(rows)
+prices_out_rows   = spark.table(PRICES_TABLE).count()
+trades_out_rows   = spark.table(TRADES_TABLE).count()
+
+_rows_in  = bronze_csv_rows + bronze_synth_rows
+_rows_out = prices_out_rows + trades_out_rows
+
+dbutils.notebook.exit(json.dumps({
+    "task": "bronze",
+    "schema": "bronze",
+    "rows_in": _rows_in,
+    "rows_out": _rows_out,
+    "rejects": 0,
+    "duplicates": max(_rows_in - _rows_out, 0),
+}))

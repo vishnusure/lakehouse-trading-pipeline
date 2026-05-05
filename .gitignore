@@ -1,0 +1,11 @@
+.DS_Store
+config/.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+/tmp/
+/tmp/stooq/
+.databricks/
+.bundle/
+.databricks-resources.json

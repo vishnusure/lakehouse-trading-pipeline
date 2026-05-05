@@ -1,296 +1,333 @@
 # Databricks notebook source
-
-# COMMAND ----------
 # MAGIC %md
-# MAGIC # 02 — Silver Layer: Clean & Conform
+# MAGIC ## Silver: typed, validated and deduplicated prices and trades
 # MAGIC
-# MAGIC Reads from Bronze, enforces schema, runs DQ checks, deduplicates, and writes
-# MAGIC clean rows to Silver. Bad rows are quarantined with a rejection reason.
-# MAGIC
-# MAGIC **Inputs**
-# MAGIC - `{catalog}.bronze.market_prices_raw`
-# MAGIC - `{catalog}.bronze.trades_raw`
-# MAGIC
-# MAGIC **Outputs**
-# MAGIC - `{catalog}.silver.market_prices`      — MERGE key: `(ticker, trade_date)`
-# MAGIC - `{catalog}.silver.trades_clean`       — MERGE key: `(trade_id)`
-# MAGIC - `{catalog}.silver.trades_quarantine`  — MERGE key: `(trade_id, version)`
-# MAGIC
-# MAGIC **DQ checks applied to trades**
-# MAGIC 1. `null_price`             — price IS NULL
-# MAGIC 2. `null_quantity`          — quantity IS NULL
-# MAGIC 3. `invalid_price_format`   — price cannot be cast to DOUBLE (e.g. "N/A")
-# MAGIC 4. `non_positive_price`     — CAST(price) <= 0
-# MAGIC 5. `non_positive_quantity`  — CAST(quantity) <= 0
-# MAGIC 6. `symbol_not_in_prices`   — symbol has no matching ticker in bronze prices
+# MAGIC Reads bronze, casts the string-typed trade columns, applies DQ rules,
+# MAGIC quarantines failures with the reason, and keeps only the latest version
+# MAGIC per trade_id in the clean output.
 
 # COMMAND ----------
 
-dbutils.widgets.text("run_date",     "",          "Run Date (YYYY-MM-DD, blank = today)")
-dbutils.widgets.text("env",          "prod",      "Environment")
-dbutils.widgets.text("catalog_name", "workspace", "Unity Catalog name")
+"""
+Silver layer for the Stooq trading pipeline.
+
+Inputs (consumed):
+  workspace.bronze.market_prices_raw
+  workspace.bronze.trades_raw
+
+Outputs (written, all overwritten on each run):
+  workspace.silver.market_prices
+  workspace.silver.trades_clean
+  workspace.silver.trades_quarantine
+
+Idempotent. Silver always reflects the current bronze truth; rows that move
+from quarantine to clean (or vice versa) on subsequent runs are handled
+naturally by the overwrite write strategy.
+"""
 
 # COMMAND ----------
 
-import datetime, json
-
+from pyspark.sql import Window
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
-catalog   = dbutils.widgets.get("catalog_name")
-env       = dbutils.widgets.get("env")
-_run_date = dbutils.widgets.get("run_date").strip()
-run_date  = datetime.date.fromisoformat(_run_date) if _run_date else datetime.date.today()
+dbutils.widgets.text("catalog_name", "workspace")
+dbutils.widgets.text("env", "dev")
+dbutils.widgets.text("run_date", "")
 
-print(f"catalog={catalog}  env={env}  run_date={run_date}")
+CATALOG = dbutils.widgets.get("catalog_name")
+
+BRONZE_PRICES = f"{CATALOG}.bronze.market_prices_raw"
+BRONZE_TRADES = f"{CATALOG}.bronze.trades_raw"
+SILVER_PRICES = f"{CATALOG}.silver.market_prices"
+SILVER_CLEAN = f"{CATALOG}.silver.trades_clean"
+SILVER_QUARANTINE = f"{CATALOG}.silver.trades_quarantine"
 
 # COMMAND ----------
-# ── Silver market prices ───────────────────────────────────────────────────────
-# Bronze prices are already typed correctly; Silver adds:
-#   • a sanity filter (close_price > 0)
-#   • lineage columns (_bronze_ts renamed, _silver_ts added)
-#   • idempotent MERGE on (ticker, trade_date)
 
-bronze_prices = (
-    spark.table(f"{catalog}.bronze.market_prices_raw")
-         .filter(F.col("close_price") > 0)                       # sanity guard
-         .withColumnRenamed("_ingest_ts", "_bronze_ts")
-         .withColumn("_silver_ts", F.current_timestamp())
-         .coalesce(1)
+# MAGIC %md
+# MAGIC ## Market prices
+
+# COMMAND ----------
+
+# Bronze prices are already typed; silver's job is to enforce non-null on the
+# join keys and rename ticker -> symbol so trades and prices can join on a
+# same-named column in gold without an explicit alias.
+prices_silver = (
+    spark.table(BRONZE_PRICES)
+        .filter(
+            F.col("ticker").isNotNull()
+            & F.col("date").isNotNull()
+            & F.col("close").isNotNull()
+        )
+        .select(
+            F.col("ticker").alias("symbol"),
+            F.col("date"),
+            F.col("open"),
+            F.col("high"),
+            F.col("low"),
+            F.col("close"),
+            F.col("volume"),
+            F.col("_ingested_at").alias("_bronze_ingested_at"),
+            F.current_timestamp().alias("_silver_processed_at"),
+        )
 )
 
-prices_rows_in  = spark.table(f"{catalog}.bronze.market_prices_raw").count()
-prices_rows_out = bronze_prices.count()
-prices_rejected = prices_rows_in - prices_rows_out
-print(f"market_prices — in={prices_rows_in}  rejected={prices_rejected}  staging={prices_rows_out}")
+(prices_silver.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(SILVER_PRICES))
 
 # COMMAND ----------
 
-spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {catalog}.silver.market_prices (
-    ticker       STRING    NOT NULL COMMENT 'Stock ticker symbol (e.g. AAPL)',
-    trade_date   DATE      NOT NULL COMMENT 'Trading date',
-    open_price   DOUBLE             COMMENT 'Opening price in USD',
-    high_price   DOUBLE             COMMENT 'Intraday high price in USD',
-    low_price    DOUBLE             COMMENT 'Intraday low price in USD',
-    close_price  DOUBLE             COMMENT 'Closing price in USD — validated > 0',
-    volume       LONG               COMMENT 'Number of shares traded',
-    _source      STRING             COMMENT 'Source system identifier',
-    _bronze_ts   TIMESTAMP          COMMENT 'UTC ingest timestamp from Bronze layer',
-    _silver_ts   TIMESTAMP          COMMENT 'UTC timestamp when Silver processed this row'
-)
-USING DELTA
-COMMENT 'Silver layer: cleaned, type-validated daily OHLCV prices. Sanity-filtered (close_price > 0). Idempotent MERGE on (ticker, trade_date).'
-CLUSTER BY (ticker, trade_date)
-""")
-
-bronze_prices.createOrReplaceTempView("_silver_prices_stage")
-
-spark.sql(f"""
-MERGE INTO {catalog}.silver.market_prices AS t
-USING _silver_prices_stage AS s
-  ON t.ticker = s.ticker AND t.trade_date = s.trade_date
-WHEN MATCHED THEN
-    UPDATE SET *
-WHEN NOT MATCHED THEN
-    INSERT *
-""")
-
-prices_total_out = spark.table(f"{catalog}.silver.market_prices").count()
-print(f"silver.market_prices total rows after MERGE: {prices_total_out}")
+# MAGIC %sql
+# MAGIC COMMENT ON TABLE workspace.silver.market_prices IS
+# MAGIC   'Daily OHLCV per symbol, non-null on (symbol, date, close). Overwritten from bronze on each run.';
+# MAGIC
+# MAGIC ALTER TABLE workspace.silver.market_prices ALTER COLUMN symbol               COMMENT 'Trading symbol including exchange suffix, e.g. AAPL.US.';
+# MAGIC ALTER TABLE workspace.silver.market_prices ALTER COLUMN date                 COMMENT 'Trading date.';
+# MAGIC ALTER TABLE workspace.silver.market_prices ALTER COLUMN open                 COMMENT 'Opening price.';
+# MAGIC ALTER TABLE workspace.silver.market_prices ALTER COLUMN high                 COMMENT 'Intraday high.';
+# MAGIC ALTER TABLE workspace.silver.market_prices ALTER COLUMN low                  COMMENT 'Intraday low.';
+# MAGIC ALTER TABLE workspace.silver.market_prices ALTER COLUMN close                COMMENT 'Closing price; used as mark for daily P&L in gold.';
+# MAGIC ALTER TABLE workspace.silver.market_prices ALTER COLUMN volume               COMMENT 'Daily traded share count.';
+# MAGIC ALTER TABLE workspace.silver.market_prices ALTER COLUMN _bronze_ingested_at  COMMENT 'Carried from bronze: when this row was MERGE-loaded.';
+# MAGIC ALTER TABLE workspace.silver.market_prices ALTER COLUMN _silver_processed_at COMMENT 'When the silver overwrite that produced this row ran.';
 
 # COMMAND ----------
-# ── Silver trades: deduplication ──────────────────────────────────────────────
-# Keep the highest version per trade_id. This eliminates the 20 v1 rows that
-# have a corresponding v2 update (v2 wins). Dirty rows (null price, bad type,
-# etc.) are new unique trade_ids so they survive dedup and are caught by DQ.
 
-dedup_window = Window.partitionBy("trade_id").orderBy(F.col("version").desc())
-
-bronze_trades_raw = spark.table(f"{catalog}.bronze.trades_raw")
-trades_rows_in    = bronze_trades_raw.count()
-
-deduped = (
-    bronze_trades_raw
-    .withColumn("_rn", F.row_number().over(dedup_window))
-    .filter(F.col("_rn") == 1)
-    .drop("_rn")
-)
-trades_rows_deduped = deduped.count()
-rows_deduplicated   = trades_rows_in - trades_rows_deduped
-print(f"trades dedup — in={trades_rows_in}  removed={rows_deduplicated}  after_dedup={trades_rows_deduped}")
+# MAGIC %md
+# MAGIC ## Trades
 
 # COMMAND ----------
-# ── Silver trades: DQ checks ───────────────────────────────────────────────────
-# Collect the valid symbol set from bronze prices (small list — safe to broadcast)
 
-valid_symbols = [
-    r["ticker"]
-    for r in spark.table(f"{catalog}.bronze.market_prices_raw")
-                  .select("ticker").distinct().collect()
+# Authoritative symbol set for referential integrity. Computed once and
+# inlined as a Python list because the catalogue is small (~7 tickers);
+# isin() against a literal list is cheaper than a broadcast join here.
+known_symbols = [
+    row["ticker"]
+    for row in spark.table(BRONZE_PRICES).select("ticker").distinct().collect()
+    if row["ticker"]
 ]
-print(f"Valid symbols from bronze prices: {valid_symbols}")
 
-dq_checked = deduped.withColumn(
-    "rejection_reason",
-    F.when(F.col("price").isNull(),                                   F.lit("null_price"))
-     .when(F.col("quantity").isNull(),                                F.lit("null_quantity"))
-     .when(F.expr("TRY_CAST(price AS DOUBLE)").isNull(),             F.lit("invalid_price_format"))
-     .when(F.expr("TRY_CAST(price AS DOUBLE)") <= 0,                 F.lit("non_positive_price"))
-     .when(F.expr("TRY_CAST(quantity AS DOUBLE)") <= 0,              F.lit("non_positive_quantity"))
-     .when(~F.col("symbol").isin(valid_symbols),                      F.lit("symbol_not_in_prices"))
-     .otherwise(F.lit(None).cast("string"))
-)
-
-clean_df     = dq_checked.filter(F.col("rejection_reason").isNull()).drop("rejection_reason")
-quarantine_df = dq_checked.filter(F.col("rejection_reason").isNotNull())
-
-trades_rows_clean    = clean_df.count()
-trades_rows_rejected = quarantine_df.count()
-print(f"DQ result — clean={trades_rows_clean}  quarantined={trades_rows_rejected}")
-
-# COMMAND ----------
-# ── Prepare clean trades for Silver ───────────────────────────────────────────
-# Cast price and quantity from STRING to DOUBLE; add lineage timestamps.
-
-clean_silver = (
-    clean_df
-    .withColumn("price",      F.expr("CAST(price AS DOUBLE)"))
-    .withColumn("quantity",   F.expr("CAST(quantity AS DOUBLE)"))
-    .withColumnRenamed("_ingest_ts", "_bronze_ts")
-    .withColumn("_silver_ts", F.current_timestamp())
-    .coalesce(1)
-)
+if not known_symbols:
+    raise RuntimeError(
+        f"No tickers in {BRONZE_PRICES}; cannot run RI checks. "
+        "Run 01_bronze before this notebook."
+    )
 
 # COMMAND ----------
 
-spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {catalog}.silver.trades_clean (
-    trade_id     STRING    NOT NULL COMMENT 'Unique trade identifier — one row per trade_id after dedup',
-    version      INT       NOT NULL COMMENT 'Highest version seen in Bronze for this trade_id',
-    symbol       STRING             COMMENT 'Instrument symbol — validated against bronze price table',
-    book         STRING             COMMENT 'Trading book (e.g. EQUITY-US, FIXED-INCOME)',
-    trade_date   DATE               COMMENT 'Trade execution date',
-    quantity     DOUBLE             COMMENT 'Quantity cast from Bronze STRING — validated > 0',
-    price        DOUBLE             COMMENT 'Price cast from Bronze STRING — validated > 0',
-    counterparty STRING             COMMENT 'Counterparty short name',
-    trader_id    STRING             COMMENT 'Trader identifier',
-    _source      STRING             COMMENT 'Source system identifier',
-    _bronze_ts   TIMESTAMP          COMMENT 'UTC ingest timestamp from Bronze layer',
-    _silver_ts   TIMESTAMP          COMMENT 'UTC timestamp when Silver processed this row'
-)
-USING DELTA
-COMMENT 'Silver layer: deduped (max version per trade_id), DQ-checked trades. Referentially consistent with silver.market_prices. MERGE key: (trade_id).'
-CLUSTER BY (trade_id, trade_date)
-""")
-
-clean_silver.createOrReplaceTempView("_trades_clean_stage")
-
-spark.sql(f"""
-MERGE INTO {catalog}.silver.trades_clean AS t
-USING _trades_clean_stage AS s
-  ON t.trade_id = s.trade_id
-WHEN MATCHED THEN
-    UPDATE SET *
-WHEN NOT MATCHED THEN
-    INSERT *
-""")
-
-trades_clean_total = spark.table(f"{catalog}.silver.trades_clean").count()
-print(f"silver.trades_clean total rows after MERGE: {trades_clean_total}")
-
-# COMMAND ----------
-# ── Uniqueness assertion on trades_clean ──────────────────────────────────────
-
-distinct_ids = spark.table(f"{catalog}.silver.trades_clean").select("trade_id").distinct().count()
-assert distinct_ids == trades_clean_total, (
-    f"Uniqueness FAILED: {distinct_ids} distinct trade_ids vs {trades_clean_total} rows"
-)
-print(f"Uniqueness assertion PASSED: {distinct_ids} unique trade_ids")
-
-# COMMAND ----------
-# ── Quarantine table ───────────────────────────────────────────────────────────
-
-quarantine_silver = (
-    quarantine_df
-    .withColumnRenamed("price",    "price_raw")
-    .withColumnRenamed("quantity", "quantity_raw")
-    .withColumn("_quarantine_ts", F.current_timestamp())
-    .drop("_ingest_ts")
-    .coalesce(1)
+# Cast the string-typed bronze columns alongside the originals so cast
+# failures (returning null via try_cast) can be distinguished from genuinely
+# null inputs in the rejection-reason logic below. ANSI SQL is on by default
+# on serverless, so plain cast() would throw on malformed values such as
+# 'abc' or '$50' instead of returning null.
+typed = (
+    spark.table(BRONZE_TRADES)
+        .withColumn("qty_cast",   F.expr("try_cast(qty AS LONG)"))
+        .withColumn("price_cast", F.expr("try_cast(price AS DOUBLE)"))
+        .withColumn("ts_cast",    F.expr("try_to_timestamp(trade_ts)"))
 )
 
-spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {catalog}.silver.trades_quarantine (
-    trade_id         STRING    NOT NULL COMMENT 'Trade identifier of the rejected row',
-    version          INT       NOT NULL COMMENT 'Version of the rejected row',
-    symbol           STRING             COMMENT 'Instrument symbol',
-    book             STRING             COMMENT 'Trading book',
-    trade_date       DATE               COMMENT 'Trade execution date',
-    quantity_raw     STRING             COMMENT 'Original raw quantity string from Bronze (preserved for audit)',
-    price_raw        STRING             COMMENT 'Original raw price string from Bronze (preserved for audit)',
-    counterparty     STRING             COMMENT 'Counterparty short name',
-    trader_id        STRING             COMMENT 'Trader identifier',
-    rejection_reason STRING    NOT NULL COMMENT 'DQ failure code: null_price | null_quantity | invalid_price_format | non_positive_price | non_positive_quantity | symbol_not_in_prices',
-    _quarantine_ts   TIMESTAMP          COMMENT 'UTC timestamp when this row was quarantined',
-    _source          STRING             COMMENT 'Source system identifier'
+# One flag column per rule. Each evaluates to the rejection reason string
+# when the rule fires and null otherwise. concat_ws skips nulls when joining,
+# so rows that pass every rule end up with rejection_reason == ''.
+flagged = (
+    typed
+        .withColumn("flag_id",
+            F.when((F.col("trade_id").isNull()) | (F.col("trade_id") == ""),
+                   F.lit("null_or_empty_trade_id")))
+        .withColumn("flag_version",
+            F.when(F.col("version").isNull(),
+                   F.lit("null_version")))
+        .withColumn("flag_qty_cast",
+            F.when(F.col("qty").isNotNull() & F.col("qty_cast").isNull(),
+                   F.lit("non_numeric_qty")))
+        .withColumn("flag_price_cast",
+            F.when(F.col("price").isNotNull() & F.col("price_cast").isNull(),
+                   F.lit("non_numeric_price")))
+        .withColumn("flag_ts_cast",
+            F.when(F.col("trade_ts").isNotNull() & F.col("ts_cast").isNull(),
+                   F.lit("non_parseable_trade_ts")))
+        .withColumn("flag_qty_range",
+            F.when(F.col("qty_cast") <= 0,
+                   F.lit("non_positive_qty")))
+        .withColumn("flag_price_range",
+            F.when(F.col("price_cast") <= 0,
+                   F.lit("non_positive_price")))
+        .withColumn("flag_side",
+            F.when(F.col("side").isNull() | ~F.col("side").isin("BUY", "SELL"),
+                   F.lit("invalid_side")))
+        .withColumn("flag_symbol",
+            F.when(F.col("symbol").isNull() | ~F.col("symbol").isin(*known_symbols),
+                   F.lit("unknown_symbol")))
+        .withColumn("rejection_reason",
+            F.concat_ws("; ",
+                F.col("flag_id"),
+                F.col("flag_version"),
+                F.col("flag_qty_cast"),
+                F.col("flag_price_cast"),
+                F.col("flag_ts_cast"),
+                F.col("flag_qty_range"),
+                F.col("flag_price_range"),
+                F.col("flag_side"),
+                F.col("flag_symbol"),
+            ))
 )
-USING DELTA
-COMMENT 'Silver layer: trades rejected by DQ checks. Each row carries a rejection_reason explaining why it failed. MERGE key: (trade_id, version).'
-CLUSTER BY (trade_id)
-""")
-
-quarantine_silver.createOrReplaceTempView("_trades_quarantine_stage")
-
-spark.sql(f"""
-MERGE INTO {catalog}.silver.trades_quarantine AS t
-USING _trades_quarantine_stage AS s
-  ON t.trade_id = s.trade_id AND t.version = s.version
-WHEN MATCHED THEN
-    UPDATE SET *
-WHEN NOT MATCHED THEN
-    INSERT *
-""")
-
-quarantine_total = spark.table(f"{catalog}.silver.trades_quarantine").count()
-print(f"silver.trades_quarantine total rows after MERGE: {quarantine_total}")
 
 # COMMAND ----------
-# ── Conditional OPTIMIZE (every 50 silver runs) ────────────────────────────────
 
-try:
-    silver_runs = spark.sql(
-        f"SELECT COUNT(*) AS n FROM {catalog}.audit.pipeline_metrics WHERE task = 'silver'"
-    ).collect()[0]["n"]
-except Exception:
-    silver_runs = 0
+# Rows that fail any rule go to quarantine with the original raw strings
+# preserved so analysts can see exactly what came in.
+quarantine = (
+    flagged.filter(F.col("rejection_reason") != "")
+        .select(
+            F.col("trade_id"),
+            F.col("version"),
+            F.col("symbol"),
+            F.col("side"),
+            F.col("qty"),
+            F.col("price"),
+            F.col("trade_ts"),
+            F.col("book"),
+            F.col("_ingested_at").alias("_bronze_ingested_at"),
+            F.col("rejection_reason"),
+            F.current_timestamp().alias("_quarantine_ts"),
+        )
+)
 
-if silver_runs > 0 and silver_runs % 50 == 0:
-    print(f"Run #{silver_runs}: triggering OPTIMIZE on silver tables")
-    spark.sql(f"OPTIMIZE {catalog}.silver.market_prices")
-    spark.sql(f"OPTIMIZE {catalog}.silver.trades_clean")
-    spark.sql(f"OPTIMIZE {catalog}.silver.trades_quarantine")
-else:
-    print(f"Skipping OPTIMIZE — silver run #{silver_runs + 1} (fires at multiples of 50)")
+(quarantine.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(SILVER_QUARANTINE))
 
 # COMMAND ----------
-# ── Metrics payload ────────────────────────────────────────────────────────────
 
-metrics = {
-    "task":                   "silver",
-    "rows_in":                prices_rows_in + trades_rows_in,
-    "rows_out":               prices_total_out + trades_clean_total,
-    "rows_in_prices":         prices_rows_in,
-    "rows_out_prices":        prices_total_out,
-    "rows_in_trades":         trades_rows_in,
-    "rows_out_trades":        trades_clean_total,
-    "rejects":                trades_rows_rejected + prices_rejected,
-    "rejects_prices":         prices_rejected,
-    "rejects_trades":         trades_rows_rejected,
-    "duplicates":             rows_deduplicated,
-    "run_ts":                 datetime.datetime.utcnow().isoformat(),
-    "catalog":                catalog,
-    "schema":                 "silver",
-}
-print(json.dumps(metrics, indent=2))
-dbutils.notebook.exit(json.dumps(metrics))
+# Latest-version-wins per trade_id. _ingested_at breaks ties when two rows
+# share both trade_id and version (shouldn't happen post bronze MERGE, but
+# the tiebreaker keeps the window deterministic).
+window_latest = Window.partitionBy("trade_id").orderBy(
+    F.col("version").desc(),
+    F.col("_ingested_at").desc(),
+)
+
+clean_candidate = flagged.filter(F.col("rejection_reason") == "")
+
+clean = (
+    clean_candidate
+        .withColumn("_rn", F.row_number().over(window_latest))
+        .filter(F.col("_rn") == 1)
+        .select(
+            F.col("trade_id"),
+            F.col("version"),
+            F.col("symbol"),
+            F.col("side"),
+            F.col("qty_cast").alias("qty"),
+            F.col("price_cast").alias("price"),
+            F.col("ts_cast").alias("trade_ts"),
+            F.to_date("ts_cast").alias("trade_date"),
+            F.col("book"),
+            F.col("_ingested_at").alias("_bronze_ingested_at"),
+            F.current_timestamp().alias("_silver_processed_at"),
+        )
+)
+
+(clean.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(SILVER_CLEAN))
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC COMMENT ON TABLE workspace.silver.trades_clean IS
+# MAGIC   'Validated trades, latest version per trade_id only. Cast types enforced; bad rows in trades_quarantine.';
+# MAGIC
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN trade_id             COMMENT 'Trade identifier; non-null after silver.';
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN version              COMMENT 'Latest version surviving dedup; max(version) per trade_id.';
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN symbol               COMMENT 'Trading symbol; guaranteed to exist in silver.market_prices.';
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN side                 COMMENT 'BUY or SELL.';
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN qty                  COMMENT 'Trade quantity, positive long.';
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN price                COMMENT 'Trade price, positive double.';
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN trade_ts             COMMENT 'Trade timestamp, parsed from bronze string.';
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN trade_date           COMMENT 'Date portion of trade_ts; gold joins to market_prices on (symbol, trade_date).';
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN book                 COMMENT 'Trading book the trade is allocated to.';
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN _bronze_ingested_at  COMMENT 'Carried from bronze: when this row was MERGE-loaded.';
+# MAGIC ALTER TABLE workspace.silver.trades_clean ALTER COLUMN _silver_processed_at COMMENT 'When the silver overwrite that produced this row ran.';
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC COMMENT ON TABLE workspace.silver.trades_quarantine IS
+# MAGIC   'Trades rejected by silver DQ rules. Raw bronze strings preserved; rejection_reason holds all violations.';
+# MAGIC
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN trade_id             COMMENT 'Trade identifier as it arrived; possibly null or empty.';
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN version              COMMENT 'Version as it arrived; possibly null.';
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN symbol               COMMENT 'Trading symbol as quoted; may not exist in market_prices.';
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN side                 COMMENT 'Trade side as it arrived; may not be BUY or SELL.';
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN qty                  COMMENT 'Raw quantity string; may be non-numeric or non-positive.';
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN price                COMMENT 'Raw price string; may be non-numeric or non-positive.';
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN trade_ts             COMMENT 'Raw timestamp string; may not parse.';
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN book                 COMMENT 'Trading book the trade is allocated to.';
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN _bronze_ingested_at  COMMENT 'Carried from bronze: when this row was MERGE-loaded.';
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN rejection_reason     COMMENT 'Semicolon-separated list of every DQ rule this row failed.';
+# MAGIC ALTER TABLE workspace.silver.trades_quarantine ALTER COLUMN _quarantine_ts       COMMENT 'When the silver run that quarantined this row finished.';
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Run metrics
+
+# COMMAND ----------
+
+# Counts are computed once here. Task 4 will persist them to
+# workspace.audit.pipeline_metrics; for now they render in the notebook.
+prices_rows_in = spark.table(BRONZE_PRICES).count()
+prices_rows_out = spark.table(SILVER_PRICES).count()
+
+trades_rows_in = spark.table(BRONZE_TRADES).count()
+trades_rows_quarantined = spark.table(SILVER_QUARANTINE).count()
+trades_rows_pre_dedup = trades_rows_in - trades_rows_quarantined
+trades_rows_out = spark.table(SILVER_CLEAN).count()
+trades_rows_deduped = trades_rows_pre_dedup - trades_rows_out
+
+metrics = spark.createDataFrame(
+    [(
+        prices_rows_in, prices_rows_out,
+        trades_rows_in, trades_rows_quarantined,
+        trades_rows_pre_dedup, trades_rows_deduped, trades_rows_out,
+    )],
+    schema=(
+        "prices_rows_in LONG, prices_rows_out LONG, "
+        "trades_rows_in LONG, trades_rows_quarantined LONG, "
+        "trades_rows_pre_dedup LONG, trades_rows_deduped LONG, trades_rows_out LONG"
+    ),
+)
+display(metrics)
+
+# COMMAND ----------
+
+display(spark.sql(f"""
+    SELECT rejection_reason, COUNT(*) AS rows
+    FROM {SILVER_QUARANTINE}
+    GROUP BY rejection_reason
+    ORDER BY rows DESC
+"""))
+
+# COMMAND ----------
+
+# Metrics handed back to 04_job_runner. rejects is the silver quarantine
+# count; duplicates is the latest-version-wins drop count.
+import json
+
+dbutils.notebook.exit(json.dumps({
+    "task": "silver",
+    "schema": "silver",
+    "rows_in": int(prices_rows_in + trades_rows_in),
+    "rows_out": int(prices_rows_out + trades_rows_out),
+    "rejects": int(trades_rows_quarantined),
+    "duplicates": int(trades_rows_deduped),
+}))

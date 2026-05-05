@@ -2,80 +2,33 @@ bundle:
   name: lakehouse-trading-pipeline
 
 variables:
-  catalog:
+  catalog_name:
+    description: Unity Catalog used for all medallion layers.
     default: workspace
-    description: Unity Catalog name (workspace = auto-provisioned Free Edition catalog)
   env:
-    default: prod
-    description: Environment tag propagated to all notebooks and audit metrics
-
-targets:
-  prod:
-    mode: production
-    workspace:
-      host: https://dbc-ca5e5d9b-f369.cloud.databricks.com
-      profile: DEFAULT
-      root_path: /Workspace/Users/vishnu.sure11@gmail.com/.bundle/${bundle.name}/${bundle.target}
+    description: Environment label written to workspace.audit.pipeline_metrics.
+    default: dev
 
 resources:
   jobs:
-    lakehouse_trading_pipeline:
-      name: lakehouse-trading-pipeline
-
-      # Daily at 06:00 UTC — processes prior day's EOD price data
-      schedule:
-        quartz_cron_expression: "0 0 6 * * ?"
-        timezone_id: "UTC"
-        pause_status: UNPAUSED
-
-      # Job-level parameters — override at run time with --job-params
-      parameters:
-        - name: run_date
-          default: ""
-        - name: env
-          default: "${var.env}"
-        - name: catalog_name
-          default: "${var.catalog}"
-
-      # ── 4 sequential tasks: bronze → silver → gold → audit ──────────────────
-      # No new_cluster / job_cluster_key specified → serverless compute (Free Edition default)
-
+    medallion_pipeline:
+      name: lakehouse-trading-pipeline-${var.env}
+      max_concurrent_runs: 1
       tasks:
-        - task_key: bronze
-          notebook_task:
-            notebook_path: ./notebooks/01_bronze.py
-            base_parameters:
-              run_date:     "{{job.parameters.run_date}}"
-              env:          "{{job.parameters.env}}"
-              catalog_name: "{{job.parameters.catalog_name}}"
-
-        - task_key: silver
-          depends_on:
-            - task_key: bronze
-          notebook_task:
-            notebook_path: ./notebooks/02_silver.py
-            base_parameters:
-              run_date:     "{{job.parameters.run_date}}"
-              env:          "{{job.parameters.env}}"
-              catalog_name: "{{job.parameters.catalog_name}}"
-
-        - task_key: gold
-          depends_on:
-            - task_key: silver
-          notebook_task:
-            notebook_path: ./notebooks/03_gold.py
-            base_parameters:
-              run_date:     "{{job.parameters.run_date}}"
-              env:          "{{job.parameters.env}}"
-              catalog_name: "{{job.parameters.catalog_name}}"
-
-        - task_key: audit
-          depends_on:
-            - task_key: gold
+        - task_key: run_pipeline
           notebook_task:
             notebook_path: ./notebooks/04_job_runner.py
             base_parameters:
-              run_date:     "{{job.parameters.run_date}}"
-              env:          "{{job.parameters.env}}"
-              catalog_name: "{{job.parameters.catalog_name}}"
-              standalone:   "false"
+              catalog_name: ${var.catalog_name}
+              env: ${var.env}
+              run_date: ""
+      schedule:
+        quartz_cron_expression: "0 0 7 * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED
+
+targets:
+  dev:
+    default: true
+    workspace:
+      host: https://dbc-ca5e5d9b-f369.cloud.databricks.com

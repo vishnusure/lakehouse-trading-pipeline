@@ -1,177 +1,146 @@
 # Databricks notebook source
-
-# COMMAND ----------
 # MAGIC %md
-# MAGIC # 04 — Job Runner & Audit
+# MAGIC ## Job runner: orchestrates 01 -> 02 -> 03 and persists run metrics
 # MAGIC
-# MAGIC **DAB mode** (`standalone=false`, default when run as the 4th sequential DAB task):
-# MAGIC Tasks 01–03 have already completed. This notebook queries current table counts,
-# MAGIC writes a `pipeline` summary row to `audit.pipeline_metrics`, and returns.
-# MAGIC
-# MAGIC **Standalone mode** (`standalone=true`, for one-shot manual runs):
-# MAGIC Calls 01–03 via `dbutils.notebook.run()` with a 30-minute timeout each, writes
-# MAGIC per-task rows AND a summary `pipeline` row to `audit.pipeline_metrics`.
-# MAGIC
-# MAGIC **`audit.pipeline_metrics`** is also used by notebooks 01–03 for the OPTIMIZE
-# MAGIC throttle: OPTIMIZE fires only when the run count for that task is a multiple of 50.
+# MAGIC Sole task in the bundle. Runs the medallion notebooks in sequence,
+# MAGIC captures the metrics each one returns via dbutils.notebook.exit, and
+# MAGIC appends a row per layer to workspace.audit.pipeline_metrics.
 
 # COMMAND ----------
 
-dbutils.widgets.text("run_date",     "",       "Run Date (YYYY-MM-DD, blank = today)")
-dbutils.widgets.text("env",          "prod",   "Environment")
-dbutils.widgets.text("catalog_name", "workspace", "Unity Catalog name")
-dbutils.widgets.text("standalone",   "false",  "Standalone mode: calls 01-03 internally (true/false)")
+"""
+Orchestrator for the Stooq medallion pipeline.
+
+Reads:
+  Whatever 01-03 read.
+
+Writes:
+  workspace.audit.pipeline_metrics  (one row per medallion layer per run)
+
+The local Stooq ingest (scripts/ingest_stooq_local.py) MUST run before this
+notebook. It deposits CSVs in /Volumes/workspace/bronze/stooq_raw_volume/
+which 01_bronze consumes. This notebook does not fetch from Stooq.
+
+Idempotent: each child notebook is idempotent, this notebook only appends to
+the audit table, and OPTIMIZE (when triggered) is safe to repeat.
+"""
 
 # COMMAND ----------
 
-import datetime, json, posixpath
+import json
+import uuid
+from datetime import datetime
 
 from pyspark.sql import Row
-from pyspark.sql.types import (
-    StructType, StructField, StringType, LongType, TimestampType,
-)
 
-catalog    = dbutils.widgets.get("catalog_name")
-env        = dbutils.widgets.get("env")
-_run_date  = dbutils.widgets.get("run_date").strip()
-run_date   = datetime.date.fromisoformat(_run_date) if _run_date else datetime.date.today()
-standalone = dbutils.widgets.get("standalone").strip().lower() == "true"
+dbutils.widgets.text("catalog_name", "workspace")
+dbutils.widgets.text("env", "dev")
+dbutils.widgets.text("run_date", "")
 
-print(f"catalog={catalog}  env={env}  run_date={run_date}  standalone={standalone}")
+CATALOG = dbutils.widgets.get("catalog_name")
+ENV = dbutils.widgets.get("env")
+RUN_DATE_PARAM = dbutils.widgets.get("run_date")
+
+AUDIT_TABLE = f"{CATALOG}.audit.pipeline_metrics"
+NOTEBOOK_TIMEOUT_SECONDS = 600
 
 # COMMAND ----------
-# ── Create audit.pipeline_metrics ─────────────────────────────────────────────
 
+# Audit table schema is fixed and kept in sync with the metric blobs the
+# child notebooks return. CREATE TABLE IF NOT EXISTS is idempotent and
+# carries the column comments.
 spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {catalog}.audit.pipeline_metrics (
-    task        STRING     NOT NULL COMMENT 'Task label: bronze | silver | gold | pipeline',
-    rows_in     LONG                COMMENT 'Total input rows read by this task',
-    rows_out    LONG                COMMENT 'Total output rows written by this task',
-    rejects     LONG                COMMENT 'Rows rejected by DQ checks',
-    duplicates  LONG                COMMENT 'Duplicate rows eliminated by deduplication',
-    run_ts      TIMESTAMP  NOT NULL COMMENT 'UTC timestamp of this pipeline run',
-    catalog     STRING              COMMENT 'Unity Catalog name used in this run',
-    run_schema  STRING              COMMENT 'Primary schema written by this task',
-    env         STRING              COMMENT 'Environment tag (prod, dev, etc.)'
+CREATE TABLE IF NOT EXISTS {AUDIT_TABLE} (
+    run_id     STRING    COMMENT 'UUID minted per orchestration; shared across the three rows of one run.',
+    task       STRING    COMMENT 'Medallion layer name: bronze, silver, or gold.',
+    catalog    STRING    COMMENT 'Unity Catalog target.',
+    schema     STRING    COMMENT 'Schema name; matches task.',
+    rows_in    LONG      COMMENT 'Input rows for the layer.',
+    rows_out   LONG      COMMENT 'Output rows for the layer (sum across all output tables).',
+    rejects    LONG      COMMENT 'Rows quarantined by silver DQ rules; zero for bronze and gold.',
+    duplicates LONG      COMMENT 'Rows collapsed by MERGE (bronze) or removed by latest-version-wins dedup (silver); zero for gold.',
+    run_ts     TIMESTAMP COMMENT 'When the audit row was written.',
+    env        STRING    COMMENT 'Environment label from the env widget.',
+    run_date   STRING    COMMENT 'Logical run date from the run_date widget; defaults to today when empty.'
 )
 USING DELTA
-COMMENT 'Audit: append-only execution metrics. One row per task per pipeline run. The OPTIMIZE throttle in each notebook reads this table to determine if maintenance is due (every 50 runs).'
-CLUSTER BY (task, run_ts)
+COMMENT 'One row per medallion task per orchestration run, written by notebooks/04_job_runner.'
 """)
 
-print("audit.pipeline_metrics ready")
+# COMMAND ----------
+
+# Run each child notebook with the same widget passthrough. Notebook paths
+# are resolved relative to this notebook's parent folder by Databricks, so
+# they work both when imported into the workspace UI and when deployed via
+# the bundle.
+run_id = str(uuid.uuid4())
+
+passthrough = {
+    "catalog_name": CATALOG,
+    "env": ENV,
+    "run_date": RUN_DATE_PARAM,
+}
+
+results = []
+for nb in ("01_bronze", "02_silver", "03_gold"):
+    metrics_blob = dbutils.notebook.run(nb, NOTEBOOK_TIMEOUT_SECONDS, passthrough)
+    results.append(json.loads(metrics_blob))
 
 # COMMAND ----------
 
-METRICS_SCHEMA = StructType([
-    StructField("task",        StringType(),    False),
-    StructField("rows_in",     LongType(),      True),
-    StructField("rows_out",    LongType(),      True),
-    StructField("rejects",     LongType(),      True),
-    StructField("duplicates",  LongType(),      True),
-    StructField("run_ts",      TimestampType(), False),
-    StructField("catalog",     StringType(),    True),
-    StructField("run_schema",  StringType(),    True),
-    StructField("env",         StringType(),    True),
-])
+now = datetime.now()
+effective_run_date = RUN_DATE_PARAM or now.strftime("%Y-%m-%d")
 
-def _write_metrics(m: dict):
-    row = Row(
-        task        = m.get("task", "unknown"),
-        rows_in     = int(m.get("rows_in", 0)),
-        rows_out    = int(m.get("rows_out", 0)),
-        rejects     = int(m.get("rejects", 0)),
-        duplicates  = int(m.get("duplicates", 0)),
-        run_ts      = datetime.datetime.fromisoformat(
-                          m.get("run_ts", datetime.datetime.utcnow().isoformat())
-                      ),
-        catalog     = m.get("catalog", catalog),
-        run_schema  = m.get("schema", ""),
-        env         = env,
+audit_rows = [
+    Row(
+        run_id=run_id,
+        task=r["task"],
+        catalog=CATALOG,
+        schema=r["schema"],
+        rows_in=int(r["rows_in"]),
+        rows_out=int(r["rows_out"]),
+        rejects=int(r["rejects"]),
+        duplicates=int(r["duplicates"]),
+        run_ts=now,
+        env=ENV,
+        run_date=effective_run_date,
     )
-    (
-        spark.createDataFrame([row], schema=METRICS_SCHEMA)
-             .write.mode("append")
-             .saveAsTable(f"{catalog}.audit.pipeline_metrics")
-    )
-    print(f"  metrics → task={row.task}  rows_in={row.rows_in}  "
-          f"rows_out={row.rows_out}  rejects={row.rejects}  duplicates={row.duplicates}")
+    for r in results
+]
+
+(spark.createDataFrame(audit_rows)
+    .write
+    .format("delta")
+    .mode("append")
+    .saveAsTable(AUDIT_TABLE))
 
 # COMMAND ----------
-# ── Standalone mode: orchestrate 01 → 02 → 03 ─────────────────────────────────
 
-if standalone:
-    # Derive sibling notebook paths from this notebook's own workspace path
-    # so the run works regardless of which workspace folder the bundle deploys to.
-    _ctx    = dbutils.entry_point.getDbutils().notebook().getContext()
-    _folder = posixpath.dirname(_ctx.notebookPath().get())
+# Periodic compaction: every 50th run, OPTIMIZE the medallion tables to
+# keep file counts in check on Free Edition. VACUUM is intentionally not
+# run here; it removes Delta time-travel history and the brief did not
+# require it.
+run_count = spark.sql(f"SELECT COUNT(*) AS c FROM {AUDIT_TABLE}").first()["c"]
 
-    nb_params = {
-        "run_date":     run_date.isoformat(),
-        "env":          env,
-        "catalog_name": catalog,
-    }
+medallion_tables = [
+    f"{CATALOG}.bronze.market_prices_raw",
+    f"{CATALOG}.bronze.trades_raw",
+    f"{CATALOG}.silver.market_prices",
+    f"{CATALOG}.silver.trades_clean",
+    f"{CATALOG}.silver.trades_quarantine",
+    f"{CATALOG}.gold.daily_pnl",
+    f"{CATALOG}.gold.positions",
+]
 
-    print("=== 01_bronze ===")
-    bronze_m = json.loads(dbutils.notebook.run(f"{_folder}/01_bronze", 1800, nb_params))
-    _write_metrics(bronze_m)
-
-    print("=== 02_silver ===")
-    silver_m = json.loads(dbutils.notebook.run(f"{_folder}/02_silver", 1800, nb_params))
-    _write_metrics(silver_m)
-
-    print("=== 03_gold ===")
-    gold_m = json.loads(dbutils.notebook.run(f"{_folder}/03_gold", 1800, nb_params))
-    _write_metrics(gold_m)
-
-    pipeline_metrics = {
-        "task":       "pipeline",
-        "rows_in":    bronze_m.get("rows_in", 0),
-        "rows_out":   gold_m.get("rows_out", 0),
-        "rejects":    silver_m.get("rejects", 0),
-        "duplicates": silver_m.get("duplicates", 0),
-        "run_ts":     datetime.datetime.utcnow().isoformat(),
-        "catalog":    catalog,
-        "schema":     "audit",
-    }
-
-else:
-    # DAB mode: 01-03 ran as upstream tasks; derive summary from current table state.
-    print("=== DAB mode: querying table counts ===")
-
-    def _safe_count(tbl):
-        try:
-            return spark.table(tbl).count()
-        except Exception:
-            return 0
-
-    pipeline_metrics = {
-        "task":       "pipeline",
-        "rows_in":    _safe_count(f"{catalog}.bronze.market_prices_raw")
-                    + _safe_count(f"{catalog}.bronze.trades_raw"),
-        "rows_out":   _safe_count(f"{catalog}.gold.positions")
-                    + _safe_count(f"{catalog}.gold.daily_pnl"),
-        "rejects":    _safe_count(f"{catalog}.silver.trades_quarantine"),
-        "duplicates": 0,
-        "run_ts":     datetime.datetime.utcnow().isoformat(),
-        "catalog":    catalog,
-        "schema":     "audit",
-    }
+if run_count >= 50 and run_count % 50 == 0:
+    for tbl in medallion_tables:
+        spark.sql(f"OPTIMIZE {tbl}")
 
 # COMMAND ----------
-# ── Write pipeline summary row ─────────────────────────────────────────────────
 
-print("=== Pipeline summary ===")
-_write_metrics(pipeline_metrics)
-print(json.dumps(pipeline_metrics, indent=2))
-
-# COMMAND ----------
-# ── Show last 10 audit rows ────────────────────────────────────────────────────
-
-display(
-    spark.table(f"{catalog}.audit.pipeline_metrics")
-         .orderBy("run_ts", ascending=False)
-         .limit(10)
-)
-
-dbutils.notebook.exit(json.dumps(pipeline_metrics))
+display(spark.sql(f"""
+    SELECT task, rows_in, rows_out, rejects, duplicates, run_ts
+    FROM {AUDIT_TABLE}
+    WHERE run_id = '{run_id}'
+    ORDER BY task
+"""))

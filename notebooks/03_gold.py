@@ -1,205 +1,191 @@
 # Databricks notebook source
-
-# COMMAND ----------
 # MAGIC %md
-# MAGIC # 03 — Gold Layer: Business Outputs
+# MAGIC ## Gold: per-trade daily P&L and book-level positions
 # MAGIC
-# MAGIC Builds two business-ready tables from Silver:
-# MAGIC
-# MAGIC - **`gold.positions`** — net quantity and weighted-average price per (book, symbol)
-# MAGIC - **`gold.daily_pnl`** — unrealized P&L per trade, marked at the last available
-# MAGIC   close price on or before the trade date (as-of join via LATERAL subquery —
-# MAGIC   no Spark 3.4+ `asof_join` API, Free Edition compatible)
-# MAGIC
-# MAGIC **Inputs**
-# MAGIC - `{catalog}.silver.trades_clean`
-# MAGIC - `{catalog}.silver.market_prices`
+# MAGIC Joins clean trades to closing prices via an asof match (latest close on
+# MAGIC or before the trade date) for daily P&L, and aggregates clean trades by
+# MAGIC book and symbol for net/gross position and VWAP.
 
 # COMMAND ----------
 
-dbutils.widgets.text("run_date",     "",          "Run Date (YYYY-MM-DD, blank = today)")
-dbutils.widgets.text("env",          "prod",      "Environment")
-dbutils.widgets.text("catalog_name", "workspace", "Unity Catalog name")
+"""
+Gold layer for the Stooq trading pipeline.
+
+Inputs (consumed):
+  workspace.silver.trades_clean
+  workspace.silver.market_prices
+
+Outputs (written, overwritten on each run):
+  workspace.gold.daily_pnl
+  workspace.gold.positions
+
+Idempotent. Both tables are recomputed from silver each run.
+"""
 
 # COMMAND ----------
 
-import datetime, json
+dbutils.widgets.text("catalog_name", "workspace")
+dbutils.widgets.text("env", "dev")
+dbutils.widgets.text("run_date", "")
 
-from pyspark.sql import functions as F
+CATALOG = dbutils.widgets.get("catalog_name")
 
-catalog   = dbutils.widgets.get("catalog_name")
-env       = dbutils.widgets.get("env")
-_run_date = dbutils.widgets.get("run_date").strip()
-run_date  = datetime.date.fromisoformat(_run_date) if _run_date else datetime.date.today()
-
-print(f"catalog={catalog}  env={env}  run_date={run_date}")
-
-# COMMAND ----------
-# ── Gold positions ─────────────────────────────────────────────────────────────
-# Net position per (book, symbol): total quantity and quantity-weighted avg price.
-# Full recompute each run (small table); MERGE on (book, symbol) for idempotency.
-
-trades = spark.table(f"{catalog}.silver.trades_clean")
-trades_rows_in = trades.count()
-print(f"Silver trades_clean rows read: {trades_rows_in}")
-
-positions_df = (
-    trades
-    .groupBy("book", "symbol")
-    .agg(
-        F.sum("quantity").alias("total_qty"),
-        (F.sum(F.col("price") * F.col("quantity")) / F.sum("quantity")).alias("avg_price"),
-    )
-    .withColumn("_gold_ts", F.current_timestamp())
-    .coalesce(1)
-)
-
-positions_rows = positions_df.count()
-print(f"Positions computed: {positions_rows} book/symbol combinations")
+SILVER_CLEAN = f"{CATALOG}.silver.trades_clean"
+SILVER_PRICES = f"{CATALOG}.silver.market_prices"
+GOLD_PNL = f"{CATALOG}.gold.daily_pnl"
+GOLD_POSITIONS = f"{CATALOG}.gold.positions"
 
 # COMMAND ----------
 
-spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {catalog}.gold.positions (
-    book       STRING    NOT NULL COMMENT 'Trading book (e.g. EQUITY-US, FIXED-INCOME)',
-    symbol     STRING    NOT NULL COMMENT 'Instrument symbol (e.g. AAPL)',
-    total_qty  DOUBLE             COMMENT 'Net quantity held in this book/symbol position',
-    avg_price  DOUBLE             COMMENT 'Quantity-weighted average entry price in USD',
-    _gold_ts   TIMESTAMP          COMMENT 'UTC timestamp when this Gold row was last computed'
-)
-USING DELTA
-COMMENT 'Gold layer: current positions — net quantity and weighted-average entry price per (book, symbol) aggregated from silver.trades_clean.'
-CLUSTER BY (book, symbol)
-""")
-
-positions_df.createOrReplaceTempView("_positions_stage")
-
-spark.sql(f"""
-MERGE INTO {catalog}.gold.positions AS t
-USING _positions_stage AS s
-  ON t.book = s.book AND t.symbol = s.symbol
-WHEN MATCHED THEN
-    UPDATE SET *
-WHEN NOT MATCHED THEN
-    INSERT *
-""")
-
-positions_total = spark.table(f"{catalog}.gold.positions").count()
-print(f"gold.positions total rows after MERGE: {positions_total}")
+# MAGIC %md
+# MAGIC ## Per-trade daily P&L
 
 # COMMAND ----------
-# ── Gold daily P&L ─────────────────────────────────────────────────────────────
-# For each trade, mark unrealized P&L using the last available close price on or
-# before the trade date.
+
+# Asof match: for each trade, attach the close on or before trade_date for the
+# same symbol, keeping the most recent such row. QUALIFY collapses the joined
+# rows in a single SQL pass without a separate window-then-filter step.
 #
-# As-of join strategy (Free Edition compatible, no Spark 3.4+ asof_join API):
-#   LATERAL subquery selects the most recent price row where:
-#     prices.ticker = trades.symbol AND prices.trade_date <= trades.trade_date
-#   ordered by price date DESC, LIMIT 1.
-#
-# LEFT JOIN so trades with no price data at all still appear (close_price=NULL,
-# unrealized_pnl=NULL) rather than being silently dropped.
-
+# Free Edition serverless does not expose Spark 3.4's asof_join, so this is
+# the canonical pre-3.4 pattern. signed_qty makes the brief's
+# (close - trade_price) * qty formula correct for SELLs without changing the
+# trade-side accounting elsewhere.
 spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {catalog}.gold.daily_pnl (
-    trade_id        STRING    NOT NULL COMMENT 'Unique trade identifier from silver.trades_clean',
-    symbol          STRING             COMMENT 'Instrument symbol',
-    book            STRING             COMMENT 'Trading book',
-    trade_date      DATE               COMMENT 'Trade execution date',
-    quantity        DOUBLE             COMMENT 'Trade quantity in shares',
-    trade_price     DOUBLE             COMMENT 'Execution price in USD (from silver.trades_clean)',
-    close_price     DOUBLE             COMMENT 'Last available close price on or before trade_date (from silver.market_prices)',
-    unrealized_pnl  DOUBLE             COMMENT 'Unrealized P&L in USD: (close_price - trade_price) * quantity',
-    _gold_ts        TIMESTAMP          COMMENT 'UTC timestamp when this Gold row was last computed'
-)
-USING DELTA
-COMMENT 'Gold layer: unrealized P&L per trade, marked at the last available close price on or before the trade date. As-of join implemented via LATERAL subquery for Free Edition compatibility.'
-CLUSTER BY (symbol, trade_date)
-""")
-
-# Register the Silver tables as views so they can be referenced in the LATERAL subquery
-spark.table(f"{catalog}.silver.trades_clean").createOrReplaceTempView("_gold_trades")
-spark.table(f"{catalog}.silver.market_prices").createOrReplaceTempView("_gold_prices")
-
-daily_pnl_df = spark.sql(f"""
+CREATE OR REPLACE TABLE {GOLD_PNL} AS
+WITH asof AS (
     SELECT
         t.trade_id,
-        t.symbol,
         t.book,
+        t.symbol,
+        t.side,
+        t.qty,
+        t.price       AS trade_price,
         t.trade_date,
-        t.quantity,
-        t.price                                       AS trade_price,
-        p.close_price,
-        (p.close_price - t.price) * t.quantity        AS unrealized_pnl,
-        current_timestamp()                            AS _gold_ts
-    FROM _gold_trades t
-    LEFT JOIN LATERAL (
-        SELECT close_price
-        FROM   _gold_prices
-        WHERE  ticker     = t.symbol
-          AND  trade_date <= t.trade_date
-        ORDER BY trade_date DESC
-        LIMIT 1
-    ) p ON TRUE
-""").coalesce(1)
-
-pnl_rows_staged = daily_pnl_df.count()
-print(f"daily_pnl rows computed: {pnl_rows_staged}")
-
-daily_pnl_df.createOrReplaceTempView("_daily_pnl_stage")
-
-spark.sql(f"""
-MERGE INTO {catalog}.gold.daily_pnl AS t
-USING _daily_pnl_stage AS s
-  ON t.trade_id = s.trade_id
-WHEN MATCHED THEN
-    UPDATE SET *
-WHEN NOT MATCHED THEN
-    INSERT *
+        p.date        AS close_date,
+        p.close       AS close_price
+    FROM {SILVER_CLEAN} t
+    LEFT JOIN {SILVER_PRICES} p
+      ON p.symbol = t.symbol
+     AND p.date  <= t.trade_date
+    QUALIFY row_number() OVER (PARTITION BY t.trade_id ORDER BY p.date DESC) = 1
+),
+signed AS (
+    SELECT
+        *,
+        CASE WHEN side = 'BUY' THEN qty ELSE -qty END AS signed_qty
+    FROM asof
+)
+SELECT
+    trade_id,
+    book,
+    symbol,
+    side,
+    qty,
+    trade_price,
+    trade_date,
+    close_date,
+    close_price,
+    signed_qty,
+    (close_price - trade_price) * signed_qty AS pnl,
+    current_timestamp() AS _gold_processed_at
+FROM signed
 """)
 
-pnl_total = spark.table(f"{catalog}.gold.daily_pnl").count()
-print(f"gold.daily_pnl total rows after MERGE: {pnl_total}")
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC COMMENT ON TABLE workspace.gold.daily_pnl IS
+# MAGIC   'One row per silver trade with mark-to-market P&L against the latest close on or before the trade date.';
+# MAGIC
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN trade_id            COMMENT 'Trade identifier from silver.trades_clean.';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN book                COMMENT 'Trading book the trade is allocated to.';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN symbol              COMMENT 'Trading symbol.';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN side                COMMENT 'BUY or SELL.';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN qty                 COMMENT 'Trade quantity (always positive).';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN trade_price         COMMENT 'Execution price.';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN trade_date          COMMENT 'Date the trade was executed.';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN close_date          COMMENT 'Price date used for the mark; equal to trade_date when prices exist for that day, otherwise the most recent prior trading day.';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN close_price         COMMENT 'Close price as of close_date.';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN signed_qty          COMMENT 'qty for BUY, -qty for SELL.';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN pnl                 COMMENT 'Mark-to-market P&L: (close_price - trade_price) * signed_qty.';
+# MAGIC ALTER TABLE workspace.gold.daily_pnl ALTER COLUMN _gold_processed_at  COMMENT 'When the gold overwrite that produced this row ran.';
 
 # COMMAND ----------
-# ── Sanity checks ──────────────────────────────────────────────────────────────
-# Log how many trades had a matching close price vs. no price available.
 
-matched = spark.table(f"{catalog}.gold.daily_pnl").filter(F.col("close_price").isNotNull()).count()
-unmatched = pnl_total - matched
-print(f"daily_pnl — matched to a close price: {matched}  no price found: {unmatched}")
+# MAGIC %md
+# MAGIC ## Positions
 
 # COMMAND ----------
-# ── Conditional OPTIMIZE (every 50 gold runs) ──────────────────────────────────
 
-try:
-    gold_runs = spark.sql(
-        f"SELECT COUNT(*) AS n FROM {catalog}.audit.pipeline_metrics WHERE task = 'gold'"
-    ).collect()[0]["n"]
-except Exception:
-    gold_runs = 0
-
-if gold_runs > 0 and gold_runs % 50 == 0:
-    print(f"Run #{gold_runs}: triggering OPTIMIZE on gold tables")
-    spark.sql(f"OPTIMIZE {catalog}.gold.positions")
-    spark.sql(f"OPTIMIZE {catalog}.gold.daily_pnl")
-else:
-    print(f"Skipping OPTIMIZE — gold run #{gold_runs + 1} (fires at multiples of 50)")
+# avg_price is the volume-weighted average price across all clean trades for
+# the (book, symbol) pair. NULLIF guards against gross_qty=0 even though
+# silver guarantees qty > 0 per row.
+spark.sql(f"""
+CREATE OR REPLACE TABLE {GOLD_POSITIONS} AS
+SELECT
+    book,
+    symbol,
+    SUM(CASE WHEN side = 'BUY' THEN qty ELSE -qty END) AS net_qty,
+    SUM(qty)                                           AS gross_qty,
+    SUM(qty * price) / NULLIF(SUM(qty), 0)             AS avg_price,
+    COUNT(*)                                           AS trade_count,
+    current_timestamp()                                AS _gold_processed_at
+FROM {SILVER_CLEAN}
+GROUP BY book, symbol
+""")
 
 # COMMAND ----------
-# ── Metrics payload ────────────────────────────────────────────────────────────
 
-metrics = {
-    "task":            "gold",
-    "rows_in":         trades_rows_in,
-    "rows_out":        positions_total + pnl_total,
-    "rows_out_positions": positions_total,
-    "rows_out_pnl":    pnl_total,
-    "rejects":         0,
-    "duplicates":      0,
-    "run_ts":          datetime.datetime.utcnow().isoformat(),
-    "catalog":         catalog,
-    "schema":          "gold",
-}
-print(json.dumps(metrics, indent=2))
-dbutils.notebook.exit(json.dumps(metrics))
+# MAGIC %sql
+# MAGIC COMMENT ON TABLE workspace.gold.positions IS
+# MAGIC   'Net and gross position with VWAP per (book, symbol), aggregated from silver.trades_clean.';
+# MAGIC
+# MAGIC ALTER TABLE workspace.gold.positions ALTER COLUMN book                COMMENT 'Trading book.';
+# MAGIC ALTER TABLE workspace.gold.positions ALTER COLUMN symbol              COMMENT 'Trading symbol.';
+# MAGIC ALTER TABLE workspace.gold.positions ALTER COLUMN net_qty             COMMENT 'Sum of signed quantities (BUY positive, SELL negative).';
+# MAGIC ALTER TABLE workspace.gold.positions ALTER COLUMN gross_qty           COMMENT 'Sum of absolute quantities; total transacted volume.';
+# MAGIC ALTER TABLE workspace.gold.positions ALTER COLUMN avg_price           COMMENT 'Volume-weighted average execution price across all trades for this (book, symbol).';
+# MAGIC ALTER TABLE workspace.gold.positions ALTER COLUMN trade_count         COMMENT 'Number of clean trades aggregated.';
+# MAGIC ALTER TABLE workspace.gold.positions ALTER COLUMN _gold_processed_at  COMMENT 'When the gold overwrite that produced this row ran.';
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Validation
+
+# COMMAND ----------
+
+display(spark.sql(f"""
+    SELECT
+        (SELECT COUNT(*) FROM {SILVER_CLEAN})                              AS clean_trades,
+        (SELECT COUNT(*) FROM {GOLD_PNL})                                  AS pnl_rows,
+        (SELECT COUNT(*) FROM {GOLD_PNL} WHERE close_price IS NULL)        AS pnl_no_close_match,
+        (SELECT COUNT(*) FROM {GOLD_POSITIONS})                            AS positions_rows
+"""))
+
+# COMMAND ----------
+
+display(spark.sql(f"SELECT * FROM {GOLD_PNL} ORDER BY trade_date, trade_id LIMIT 10"))
+
+# COMMAND ----------
+
+display(spark.sql(f"SELECT * FROM {GOLD_POSITIONS} ORDER BY book, symbol"))
+
+# COMMAND ----------
+
+# Metrics handed back to 04_job_runner. Gold doesn't reject or dedup;
+# rows_in is the silver clean count and rows_out sums both gold tables.
+import json
+
+_clean_rows = spark.table(SILVER_CLEAN).count()
+_pnl_rows   = spark.table(GOLD_PNL).count()
+_pos_rows   = spark.table(GOLD_POSITIONS).count()
+
+dbutils.notebook.exit(json.dumps({
+    "task": "gold",
+    "schema": "gold",
+    "rows_in": _clean_rows,
+    "rows_out": _pnl_rows + _pos_rows,
+    "rejects": 0,
+    "duplicates": 0,
+}))
