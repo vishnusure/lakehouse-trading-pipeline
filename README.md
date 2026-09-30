@@ -1,5 +1,7 @@
 # lakehouse-trading-pipeline
 
+An end-to-end trading data pipeline POC developed using Claude Code and the Databricks AI Development Kit, demonstrating automated orchestration, pipeline deployment, and the generation and management of production-ready data engineering notebook source code. The solution leverages Claude Code AI, Databricks Best Practices Claude Skills and the Databricks MCP Server to accelerate development and enable AI-assisted implementation of the trading data pipelines.
+
 A Databricks Free Edition medallion pipeline for daily Stooq trading data. Bronze ingests raw CSVs landed by a local script and synthesises a deliberately dirty trades table. Silver casts, validates, deduplicates, and quarantines. Gold computes per-trade P&L (asof match against the latest available close) and book-level positions.
 
 ## Why local-then-cloud
